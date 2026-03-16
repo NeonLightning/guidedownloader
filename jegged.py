@@ -28,6 +28,12 @@ adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
 session.mount("https://", adapter)
 session.mount("http://",  adapter)
 
+THUMB_SIZES = {
+    "160p": (160, 213),
+    "320p": (320, 427),
+    "480p": (480, 640),
+}
+
 RESOLUTIONS = {
     "kindle": (758,  1024),   # Kindle basic / Paperwhite portrait width
     "480p":   (480,   640),
@@ -48,6 +54,9 @@ CONTENT_SELECTORS = [
     "#primary article",
     ".walkthrough",
     ".page-content",
+    "main.main-game",
+    "#main-content",
+    "main",
 ]
 
 # Jegged domain root – used to filter internal links
@@ -91,7 +100,14 @@ def compress_epub(path):
     os.replace(tmp, path)
     print(f"Compressed: {path}")
 
-def download_image(url, folder, max_size=(720, 960), quality=75, grayscale=False, contrast=1.0):
+def download_image(url, folder, max_size=(720, 960), quality=75, grayscale=False, contrast=1.0,
+                   thumb_size=(320, 427)):
+    """
+    Downloads an image and saves two versions:
+      folder/name.jpg          — thumbnail (max_size, for inline display)
+      folder/full/name.jpg     — full-size (original quality, for viewer)
+    Returns name (thumbnail filename) or None.
+    """
     if url.startswith("data:"):
         return None
     if any(domain in url for domain in BLOCKED_DOMAINS):
@@ -100,7 +116,13 @@ def download_image(url, folder, max_size=(720, 960), quality=75, grayscale=False
         name = os.path.basename(urlparse(url).path)
         if '.' not in name:
             name += '.jpg'
+        # Always normalise to .jpg
+        if not name.lower().endswith(('.jpg', '.jpeg', '.svg')):
+            name = os.path.splitext(name)[0] + '.jpg'
         path = os.path.join(folder, name)
+        full_folder = os.path.join(folder, "full")
+        full_path   = os.path.join(full_folder, name)
+        os.makedirs(full_folder, exist_ok=True)
         if not os.path.exists(path):
             headers = {"Accept": "image/jpeg,image/png,image/*", "User-Agent": "Mozilla/5.0"}
             r = session.get(url, timeout=20, headers=headers)
@@ -109,50 +131,61 @@ def download_image(url, folder, max_size=(720, 960), quality=75, grayscale=False
             if name.lower().endswith('.svg'):
                 with open(path, "wb") as f:
                     f.write(r.content)
+                with open(full_path, "wb") as f:
+                    f.write(r.content)
             else:
                 try:
                     img = Image.open(io.BytesIO(r.content))
-                    # Convert mode — "L" = 8-bit grayscale, "RGB" = color
                     img = img.convert("L" if grayscale else "RGB")
                     if contrast != 1.0:
                         img = ImageEnhance.Contrast(img).enhance(contrast)
-                    target_w, target_h = max_size
-                    orig_w, orig_h = img.size
-                    new_h = int(orig_h * target_w / orig_w)
-                    if new_h > target_h:
-                        new_w = int(orig_w * target_h / orig_h)
-                        img = img.resize((new_w, target_h), Image.LANCZOS)
-                    else:
-                        img = img.resize((target_w, new_h), Image.LANCZOS)
-                    name = os.path.splitext(name)[0] + '.jpg'
-                    path = os.path.join(folder, name)
+
                     save_kwargs = dict(
-                        format='JPEG',
-                        optimize=True,
-                        progressive=True,
-                        quality=quality,
+                        format='JPEG', optimize=True, progressive=True, quality=quality,
                     )
                     if not grayscale:
-                        save_kwargs['subsampling'] = 2  # 4:2:0 — most aggressive chroma subsampling
-                    img.save(path, **save_kwargs)
+                        save_kwargs['subsampling'] = 2
+
+                    orig_w, orig_h = img.size
+
+                    # Save full-size version (capped at max_size, no thumb crop)
+                    fw, fh = max_size
+                    fnh = int(orig_h * fw / orig_w)
+                    if fnh > fh:
+                        fnw = int(orig_w * fh / orig_h)
+                        full_img = img.resize((fnw, fh), Image.LANCZOS)
+                    else:
+                        full_img = img.resize((fw, fnh), Image.LANCZOS)
+                    full_img.save(full_path, **save_kwargs)
+
+                    # Save thumbnail version
+                    tw, th = thumb_size
+                    tnh = int(orig_h * tw / orig_w)
+                    if tnh > th:
+                        tnw = int(orig_w * th / orig_h)
+                        thumb_img = img.resize((tnw, th), Image.LANCZOS)
+                    else:
+                        thumb_img = img.resize((tw, tnh), Image.LANCZOS)
+                    thumb_img.save(path, **save_kwargs)
+
                 except Exception as img_err:
                     print(f"  PIL failed for {url}: {img_err} — writing raw bytes")
-                    # Raw fallback: if grayscale was requested, don't silently
-                    # save a color file — skip it instead so it isn't embedded
                     if grayscale:
                         return None
                     with open(path, "wb") as f:
+                        f.write(r.content)
+                    with open(full_path, "wb") as f:
                         f.write(r.content)
         return name
     except Exception as e:
         print(f"  Failed to download image {url}: {e}")
         return None
 
-def download_images_parallel(image_urls, img_folder, max_size=(720, 960), quality=75, grayscale=False, contrast=1.0):
+def download_images_parallel(image_urls, img_folder, max_size=(720, 960), quality=75, grayscale=False, contrast=1.0, thumb_size=(320, 427)):
     downloaded = []
     with ThreadPoolExecutor(max_workers=10) as executor:  # image downloads
         future_to_url = {
-            executor.submit(download_image, url, img_folder, max_size, quality, grayscale, contrast): url
+            executor.submit(download_image, url, img_folder, max_size, quality, grayscale, contrast, thumb_size): url
             for url in image_urls
         }
         for future in as_completed(future_to_url):
@@ -484,7 +517,7 @@ def find_content(soup):
     return soup.find("body")
 
 def process_page(driver, url, img_folder, link_map, max_size=(720, 960),
-                 quality=75, no_images=False, grayscale=False, contrast=1.0):
+                 quality=75, no_images=False, grayscale=False, contrast=1.0, thumb_size=(320, 427)):
     # Try fast requests fetch first; fall back to Selenium if it fails
     try:
         raw_soup = fetch_soup(url)
@@ -519,10 +552,16 @@ def process_page(driver, url, img_folder, link_map, max_size=(720, 960),
     # Collect ALL candidates into plain lists BEFORE decomposing anything —
     # decompose() modifies the tree in place which corrupts subsequent
     # find_all results and causes NoneType errors on the next iteration.
-    inactive_panes = [
-        p for p in content_el.find_all("div", class_="tab-pane")
-        if p and "active" not in p.get("class", [])
-    ]
+    all_panes = content_el.find_all("div", class_="tab-pane")
+    has_active = any("active" in p.get("class", []) for p in all_panes if p)
+    # Only strip inactive panes when JS has set an active class (live browser).
+    # If none are active we fetched via requests (no JS) — keep all panes.
+    inactive_panes = []
+    if has_active:
+        inactive_panes = [
+            p for p in all_panes
+            if p and "active" not in p.get("class", [])
+        ]
     nav_tab_lists = list(content_el.find_all("ul", class_="nav-tabs"))
     for p in inactive_panes:
         p.decompose()
@@ -542,10 +581,12 @@ def process_page(driver, url, img_folder, link_map, max_size=(720, 960),
     for tag in content_el(["script", "style", "noscript", "iframe", "svg", "video", "source"]):
         tag.decompose()
     for selector in [
-        "[class*='ad']", "[class*='promo']", "[class*='sponsor']",
-        "[class*='video']", "[class*='paging']", "[class*='social']",
-        "[class*='share']", "[class*='comment']", "nav", "footer",
-        ".sidebar", "#sidebar", ".widget",
+        ".ad", ".ads", ".advert", ".advertisement", ".ad-container",
+        ".ad-wrapper", ".ad-block", "[id^='ad-']", "[id^='ads-']",
+        ".promo", ".sponsor", ".sponsored",
+        "[class*='video']", "[class*='paging']",
+        ".social-share", ".share-buttons", ".comments", ".comment-section",
+        "nav", "footer", ".sidebar", "#sidebar", ".widget",
     ]:
         for el in content_el.select(selector):
             el.decompose()
@@ -569,15 +610,21 @@ def process_page(driver, url, img_folder, link_map, max_size=(720, 960),
             img.decompose()
 
     if not no_images:
-        downloaded = download_images_parallel(list(img_map.values()), img_folder, max_size, quality, grayscale, contrast)
+        downloaded = download_images_parallel(list(img_map.values()), img_folder, max_size, quality, grayscale, contrast, thumb_size)
         url_to_name = {u: n for u, n in downloaded}
         for p in content_el.find_all("p"):
             pid = p.get("id", "")
             if pid in img_map:
                 orig_url = img_map[pid]
                 if orig_url in url_to_name:
-                    new_img = content_soup.new_tag("img", src=img_folder + "/" + url_to_name[orig_url])
-                    p.replace_with(new_img)
+                    img_src = img_folder + "/" + url_to_name[orig_url]
+                    new_img = content_soup.new_tag("img", src=img_src)
+                    # img_viewer_map is populated after scraping, so store
+                    # a placeholder href using the image filename — fix_image_links
+                    # will resolve it to the viewer xhtml after the map is built
+                    new_a = content_soup.new_tag("a", **{"href": "__IMG_VIEWER__" + url_to_name[orig_url], "class": "img-link"})
+                    new_a.append(new_img)
+                    p.replace_with(new_a)
                 else:
                     p.decompose()
 
@@ -653,6 +700,9 @@ def main():
                         help="Image resolution (default: 720p)")
     parser.add_argument("--workers", default=8, type=int,
                         help="Max parallel fetch/scrape threads (default: 8)")
+    parser.add_argument("--thumb-size", default="320p",
+                        choices=["160p","320p","480p"],
+                        help="Thumbnail size for inline images (default: 320p)")
     parser.add_argument("--contrast", default=1.0, type=float,
                         help="Contrast multiplier for images (default: 1.0, try 1.3-1.8 for e-ink)")
     parser.add_argument("--grayscale", action="store_true",
@@ -804,11 +854,12 @@ def main():
         no_images   = args.no_images
         grayscale   = args.grayscale
         contrast    = args.contrast
+        thumb_size  = THUMB_SIZES[args.thumb_size]
 
         def scrape_one(item):
             t, u, d, it = item
             result = process_page(driver, u, img_folder, link_map, max_size,
-                                  img_quality, no_images, grayscale, contrast)
+                                  img_quality, no_images, grayscale, contrast, thumb_size)
             return (t, u, d, it, result)
 
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
@@ -874,7 +925,7 @@ def main():
             title = last_seg.replace("-", " ").replace("_", " ").title()
             try:
                 pg_content, _, fp = process_page(driver, extra_url, img_folder, link_map,
-                                                  max_size, img_quality, no_images, grayscale, contrast)
+                                                  max_size, img_quality, no_images, grayscale, contrast, thumb_size)
                 return (extra_url, title, pg_content, fp)
             except Exception as e:
                 print(f"  Failed to scrape extra page {extra_url}: {e}")
@@ -922,17 +973,65 @@ def main():
             flat_toc.append(epub.Link(ch.file_name, prefix + t, ch.file_name))
         book.toc = tuple(flat_toc)
 
-        # Embed images
+        # Embed thumbnail and full-size images, create viewer xhtml pages.
         if not args.no_images:
+            full_folder = os.path.join(img_folder, "full")
             for f in os.listdir(img_folder):
                 path = os.path.join(img_folder, f)
+                if not os.path.isfile(path):
+                    continue  # skip the full/ subdirectory itself
                 ext = f.split(".")[-1].lower()
                 mt = "image/jpeg" if ext in ["jpg", "jpeg"] else f"image/{ext}"
-                with open(path, "rb") as img:
+                # Embed thumbnail
+                with open(path, "rb") as img_file:
                     book.add_item(epub.EpubItem(
                         uid=f, file_name=img_folder + "/" + f,
-                        media_type=mt, content=img.read()
+                        media_type=mt, content=img_file.read()
                     ))
+                # Embed full-size version
+                full_path = os.path.join(full_folder, f)
+                if os.path.exists(full_path):
+                    with open(full_path, "rb") as img_file:
+                        book.add_item(epub.EpubItem(
+                            uid="full-" + f,
+                            file_name=img_folder + "/full/" + f,
+                            media_type=mt, content=img_file.read()
+                        ))
+        # Resolve __IMG_VIEWER__ placeholders: create one viewer page per
+        # (image, chapter) pair so the back link goes to the exact source chapter.
+        if not args.no_images:
+            viewer_uid_seen = set()
+            for chapter, _, _, _ in chapters:
+                soup = BeautifulSoup(chapter.content, "lxml")
+                changed = False
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if not href.startswith("__IMG_VIEWER__"):
+                        continue
+                    img_name = href[len("__IMG_VIEWER__"):]
+                    # Unique viewer per (chapter, image)
+                    stem       = os.path.splitext(img_name)[0]
+                    chap_stem  = os.path.splitext(chapter.file_name)[0]
+                    viewer_name = f"img-view-{chap_stem}-{stem}.xhtml"
+                    if viewer_name not in viewer_uid_seen:
+                        viewer_uid_seen.add(viewer_name)
+                        viewer = epub.EpubHtml(
+                            title=img_name,
+                            file_name=viewer_name,
+                            content=f'''<style>
+body{{margin:0;padding:0;background:#000;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center}}
+img{{max-width:100%;max-height:calc(100vh - 3em);object-fit:contain}}
+#back{{position:fixed;top:0.5em;left:0.5em;background:rgba(0,0,0,0.6);color:#fff;border:1px solid #fff;border-radius:4px;padding:0.3em 0.8em;font-size:1.1em;text-decoration:none;z-index:999}}
+#back:hover{{background:rgba(255,255,255,0.2)}}
+</style>
+<a id="back" href="{chapter.file_name}">&#8592; Back</a>
+<img src="{img_folder}/full/{img_name}" alt="{img_name}"/>'''
+                        )
+                        book.add_item(viewer)
+                    a["href"] = viewer_name
+                    changed = True
+                if changed:
+                    chapter.content = str(soup).encode()
 
         book.add_item(epub.EpubNav())
         book.add_item(epub.EpubNcx())
