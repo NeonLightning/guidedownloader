@@ -1009,10 +1009,10 @@ def main():
                     if not href.startswith("__IMG_VIEWER__"):
                         continue
                     img_name = href[len("__IMG_VIEWER__"):]
-                    # Unique viewer per (chapter, image)
-                    stem       = os.path.splitext(img_name)[0]
-                    chap_stem  = os.path.splitext(chapter.file_name)[0]
-                    viewer_name = f"img-view-{chap_stem}-{stem}.xhtml"
+                    # Use a short hash-based name to avoid long/invalid filenames
+                    import hashlib
+                    uid = hashlib.md5(f"{chapter.file_name}:{img_name}".encode()).hexdigest()[:10]
+                    viewer_name = f"v{uid}.xhtml"
                     if viewer_name not in viewer_uid_seen:
                         viewer_uid_seen.add(viewer_name)
                         viewer = epub.EpubHtml(
@@ -1028,6 +1028,7 @@ img{{max-width:100%;max-height:calc(100vh - 3em);object-fit:contain}}
 <img src="{img_folder}/full/{img_name}" alt="{img_name}"/>'''
                         )
                         book.add_item(viewer)
+                        spine.append(viewer)
                     a["href"] = viewer_name
                     changed = True
                 if changed:
